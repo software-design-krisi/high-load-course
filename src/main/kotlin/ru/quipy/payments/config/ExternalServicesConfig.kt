@@ -52,9 +52,11 @@ class ExternalServicesConfig {
         )
     }
 
-    @Bean(PRIMARY_PAYMENT_BEAN)
-    fun fastExternalService() =
-        PaymentExternalServiceImpl(
-            accountProps_4,
+    @Bean(name = [PRIMARY_PAYMENT_BEAN])
+    fun fastExternalService(): PaymentExternalServiceImpl {
+        return PaymentExternalServiceImpl(
+            accountProps_1,
+            accountProps_2
         )
+    }
 }
