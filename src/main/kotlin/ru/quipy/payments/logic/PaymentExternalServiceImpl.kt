@@ -38,9 +38,11 @@ class PaymentExternalServiceImpl(
     private val accountName1 = properties1.accountName
     private val serviceName2 = properties2.serviceName
     private val accountName2 = properties2.accountName
-    private val window1 = NonBlockingOngoingWindow(properties2.parallelRequests)
+
+    private val window1 = NonBlockingOngoingWindow(properties1.parallelRequests)
     private val window2 = NonBlockingOngoingWindow(properties2.parallelRequests)
-    private val rateLimiter = RateLimiter(750)
+    private val rateLimiter1 = RateLimiter(properties1.rateLimitPerSec)
+    private val rateLimiter2 = RateLimiter(properties2.rateLimitPerSec)
     private val processTime1 = arrayListOf<Long>()
     private val processTime2 = arrayListOf<Long>()
 
@@ -52,13 +54,6 @@ class PaymentExternalServiceImpl(
     private val client = OkHttpClient.Builder().run {
         dispatcher(Dispatcher(httpClientExecutor))
         build()
-    }
-
-    private fun closeWindow(accountName: String){
-        if (accountName == accountName2)
-            window2.releaseWindow()
-        else
-            window1.releaseWindow()
     }
 
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
@@ -76,26 +71,23 @@ class PaymentExternalServiceImpl(
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        if (!rateLimiter.tick()){
-            closeWindow(accountName)
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-            }
-            return
-        }
-
         var window = window2.putIntoWindow()
-        if (window is NonBlockingOngoingWindow.WindowResponse.Fail
-            || Duration.ofSeconds((now() - paymentStartedAt) / 1000) > Duration.ofSeconds(20)){
+        if (!rateLimiter2.tick()
+            || window is NonBlockingOngoingWindow.WindowResponse.Fail){
+            if (window is NonBlockingOngoingWindow.WindowResponse.Success)
+                window2.releaseWindow()
             window = window1.putIntoWindow()
-            if (window is NonBlockingOngoingWindow.WindowResponse.Success
+            if (rateLimiter1.tick()
+                && window is NonBlockingOngoingWindow.WindowResponse.Success
                 && Duration.ofSeconds((now() - paymentStartedAt) / 1000) < paymentOperationTimeout){
                 accountName = accountName1
                 serviceName = serviceName1
-                val speed = minOf(window.currentWinSize.div(processTime1.average()).toInt(), 750)
+                val speed = minOf(properties1.parallelRequests.div(processTime1.average()).toInt(), properties1.rateLimitPerSec)
                 logger.warn("[$accountName] Theoretical speed for $paymentId , txId $transactionId : $speed")
             }
             else{
+                if (window is NonBlockingOngoingWindow.WindowResponse.Success)
+                    window1.releaseWindow()
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                 }
@@ -103,7 +95,7 @@ class PaymentExternalServiceImpl(
             }
         }
         else{
-            val speed = minOf(window.currentWinSize.div(processTime2.average()).toInt(), 750)
+            val speed = minOf(properties2.parallelRequests.div(processTime2.average()).toInt(), properties2.rateLimitPerSec)
             logger.warn("[$accountName] Theoretical speed for $paymentId , txId $transactionId : $speed")
         }
 
@@ -146,11 +138,14 @@ class PaymentExternalServiceImpl(
                 }
             }
         } finally {
-            closeWindow(accountName)
-            if (accountName == accountName2)
+            if (accountName == accountName2){
+                window2.releaseWindow()
                 processTime2.add((now() - paymentStartedAt) / 1000)
-            else
+            }
+            else{
+                window1.releaseWindow()
                 processTime1.add((now() - paymentStartedAt) / 1000)
+            }
         }
     }
 }
