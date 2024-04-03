@@ -6,7 +6,6 @@ import com.google.common.util.concurrent.ThreadFactoryBuilder
 import okhttp3.*
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
-import ru.quipy.common.utils.NonBlockingOngoingWindow
 import ru.quipy.common.utils.RateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -40,35 +39,36 @@ class PaymentExternalServiceImpl(
     private val rateLimiter4 = RateLimiter(properties4.rateLimitPerSec)
     private val rateLimiter3 = RateLimiter(properties3.rateLimitPerSec)
     private val rateLimiter2 = RateLimiter(properties2.rateLimitPerSec)
-    private val processTime4 = arrayListOf<Long>()
-    private val processTime3 = arrayListOf<Long>()
-    private val processTime2 = arrayListOf<Long>()
+    private val processTime4 = arrayListOf<Double>()
+    private val processTime3 = arrayListOf<Double>()
+    private val processTime2 = arrayListOf<Double>()
 
     @Autowired
     private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
-
-    private val queue4 = ArrayBlockingQueue<Runnable>(properties4.parallelRequests)
-    private val queue3 = ArrayBlockingQueue<Runnable>(properties3.parallelRequests)
-    private val queue2 = ArrayBlockingQueue<Runnable>(properties2.parallelRequests)
 
     private val accountExecutor4 = ThreadPoolExecutor(properties4.parallelRequests,
         properties4.parallelRequests,
         paymentOperationTimeout.seconds,
         TimeUnit.SECONDS,
         ArrayBlockingQueue(properties4.parallelRequests),
-        createNamedThreadFactory("account4"))
+        createNamedThreadFactory("account4"),
+        ThreadPoolExecutor.CallerRunsPolicy())
+
     private val accountExecutor3 = ThreadPoolExecutor(properties3.parallelRequests,
         properties3.parallelRequests,
         paymentOperationTimeout.seconds,
         TimeUnit.SECONDS,
         ArrayBlockingQueue(properties3.parallelRequests),
-        createNamedThreadFactory("account3"))
+        createNamedThreadFactory("account3"),
+        ThreadPoolExecutor.CallerRunsPolicy())
+
     private val accountExecutor2 = ThreadPoolExecutor(properties2.parallelRequests,
         properties2.parallelRequests,
         paymentOperationTimeout.seconds,
         TimeUnit.SECONDS,
         ArrayBlockingQueue(properties2.parallelRequests),
-        createNamedThreadFactory("account2"))
+        createNamedThreadFactory("account2"),
+        ThreadPoolExecutor.CallerRunsPolicy())
 
     private val client4 = OkHttpClient.Builder()
         .dispatcher(Dispatcher(accountExecutor4))
@@ -85,19 +85,32 @@ class PaymentExternalServiceImpl(
         .protocols(Collections.singletonList(Protocol.H2_PRIOR_KNOWLEDGE))
         .build()
 
-    private fun chooseAccount(): ExternalServiceProperties {
-        if (accountExecutor4.queue.remainingCapacity() <= properties4.parallelRequests/2 || (processTime4.average() > processTime2.average() && processTime4.average() > processTime3.average())){
-            if (accountExecutor3.queue.remainingCapacity() <= properties3.parallelRequests/2 || processTime3.average() > processTime2.average() )
-                return properties2
-            return properties3
+    private fun chooseAccount(): Pair<ExternalServiceProperties, Boolean> {
+        if (!rateLimiter4.tick()
+            || accountExecutor4.queue.remainingCapacity() <= 0) {
+            if (rateLimiter3.tick() && accountExecutor3.queue.remainingCapacity() > 0)
+                return Pair(properties3, true)
+            else {
+                if (rateLimiter2.tick() && accountExecutor2.queue.remainingCapacity() > 0)
+                    return Pair(properties2, true)
+                else {
+                    if (accountExecutor4.queue.remainingCapacity() <= 0 || (processTime4.average() > processTime2.average() && processTime4.average() > processTime3.average())){
+                        if (accountExecutor3.queue.remainingCapacity() <= 0 || processTime3.average() > processTime2.average() )
+                            return Pair(properties2, false)
+                        return Pair(properties3, false)
+                    }
+                    else
+                        return Pair(properties4, false)
+                }
+            }
         }
         else
-            return properties4
+            return Pair(properties4, true)
     }
 
 
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
-        val properties = chooseAccount()
+        val (properties, isTick) = chooseAccount()
 
         logger.warn("[${properties.accountName}] Submitting payment request for payment $paymentId. Already passed: ${now() - paymentStartedAt} ms")
 
@@ -122,32 +135,21 @@ class PaymentExternalServiceImpl(
             else -> accountExecutor2
         }
 
-        if (time.average() * accountExecutor.queue.size + ((now() - paymentStartedAt) / 1000) >= paymentOperationTimeout.seconds) {
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-            }
-            return
-        }
-
-        val rateLimiter = when (properties) {
-            properties4 -> rateLimiter4
-            properties3 -> rateLimiter3
-            else -> rateLimiter2
-        }
-
         try {
-            var isSubmitted = false
-            while (!isSubmitted) {
-                if (now() - paymentStartedAt / 1000 >= paymentOperationTimeout.seconds)
-                    throw RejectedExecutionException()
-                if (rateLimiter.tick()) {
-                    accountExecutor.submit {
-                        processPaymentRequest(paymentId, transactionId, paymentStartedAt, properties)
-                    }
-                    isSubmitted = true
-                }
+            if (!isTick) {
+                if (time.average() == 0.0)
+                    Thread.sleep(500)
                 else
-                    TimeUnit.SECONDS.sleep(1)
+                    Thread.sleep((time.average() * 1000).toLong())
+            }
+            if (time.average() + ((now() - paymentStartedAt) / 1000) >= paymentOperationTimeout.seconds) {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                }
+                return
+            }
+            accountExecutor.submit {
+                processPaymentRequest(paymentId, transactionId, paymentStartedAt, properties)
             }
         }
         catch (ex: RejectedExecutionException){
@@ -215,8 +217,7 @@ class PaymentExternalServiceImpl(
                 properties3 -> processTime3
                 else -> processTime2
             }
-
-            time.add((now() - paymentStartedAt) / 1000)
+            time.add((now() - paymentStartedAt).toDouble() / 1000)
         }
     }
 }
