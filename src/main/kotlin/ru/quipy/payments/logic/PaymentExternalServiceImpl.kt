@@ -2,20 +2,17 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import com.google.common.util.concurrent.ThreadFactoryBuilder
 import okhttp3.*
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
-import ru.quipy.common.utils.NonBlockingOngoingWindow
 import ru.quipy.common.utils.RateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.Executors
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.TimeoutException
+import java.util.concurrent.*
 
 
 // Advice: always treat time as a Duration
@@ -33,79 +30,87 @@ class PaymentExternalServiceImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+
+        fun createNamedThreadFactory(name: String) : ThreadFactory {
+            return ThreadFactoryBuilder().setNameFormat(name + "-%d").setDaemon(true).build();
+        }
     }
 
     private val rateLimiter4 = RateLimiter(properties4.rateLimitPerSec)
     private val rateLimiter3 = RateLimiter(properties3.rateLimitPerSec)
     private val rateLimiter2 = RateLimiter(properties2.rateLimitPerSec)
-    private val processTime4 = arrayListOf<Long>()
-    private val processTime3 = arrayListOf<Long>()
-    private val processTime2 = arrayListOf<Long>()
+    private val processTime4 = arrayListOf<Double>()
+    private val processTime3 = arrayListOf<Double>()
+    private val processTime2 = arrayListOf<Double>()
 
     @Autowired
     private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 
-    private val queue4 = LinkedBlockingQueue<PaymentInfo>(properties4.parallelRequests)
-    private val queue3 = LinkedBlockingQueue<PaymentInfo>(properties3.parallelRequests)
-    private val queue2 = LinkedBlockingQueue<PaymentInfo>(properties2.parallelRequests)
+    private val accountExecutor4 = ThreadPoolExecutor(properties4.parallelRequests,
+        properties4.parallelRequests,
+        paymentOperationTimeout.seconds,
+        TimeUnit.SECONDS,
+        ArrayBlockingQueue(properties4.parallelRequests),
+        createNamedThreadFactory("account4"),
+        ThreadPoolExecutor.CallerRunsPolicy())
 
-    private val accountExecutor4 = Executors.newFixedThreadPool(properties4.parallelRequests)
-    private val accountExecutor3 = Executors.newFixedThreadPool(properties3.parallelRequests)
-    private val accountExecutor2 = Executors.newFixedThreadPool(properties2.parallelRequests)
+    private val accountExecutor3 = ThreadPoolExecutor(properties3.parallelRequests,
+        properties3.parallelRequests,
+        paymentOperationTimeout.seconds,
+        TimeUnit.SECONDS,
+        ArrayBlockingQueue(properties3.parallelRequests),
+        createNamedThreadFactory("account3"),
+        ThreadPoolExecutor.CallerRunsPolicy())
+
+    private val accountExecutor2 = ThreadPoolExecutor(properties2.parallelRequests,
+        properties2.parallelRequests,
+        paymentOperationTimeout.seconds,
+        TimeUnit.SECONDS,
+        ArrayBlockingQueue(properties2.parallelRequests),
+        createNamedThreadFactory("account2"),
+        ThreadPoolExecutor.CallerRunsPolicy())
 
     private val client4 = OkHttpClient.Builder()
-        .dispatcher(Dispatcher(accountExecutor4).apply { maxRequests = properties4.parallelRequests })
+        .dispatcher(Dispatcher(accountExecutor4))
         .protocols(Collections.singletonList(Protocol.H2_PRIOR_KNOWLEDGE))
-        .connectionPool(ConnectionPool(properties4.parallelRequests, paymentOperationTimeout.seconds, TimeUnit.SECONDS))
         .build()
 
     private val client3 = OkHttpClient.Builder()
-        .dispatcher(Dispatcher(accountExecutor3).apply { maxRequests = properties3.parallelRequests })
+        .dispatcher(Dispatcher(accountExecutor3))
         .protocols(Collections.singletonList(Protocol.H2_PRIOR_KNOWLEDGE))
-        .connectionPool(ConnectionPool(properties3.parallelRequests, paymentOperationTimeout.seconds, TimeUnit.SECONDS))
         .build()
 
     private val client2 = OkHttpClient.Builder()
-        .dispatcher(Dispatcher(accountExecutor2).apply { maxRequests = properties2.parallelRequests })
+        .dispatcher(Dispatcher(accountExecutor2))
         .protocols(Collections.singletonList(Protocol.H2_PRIOR_KNOWLEDGE))
-        .connectionPool(ConnectionPool(properties2.parallelRequests, paymentOperationTimeout.seconds, TimeUnit.SECONDS))
         .build()
 
-    private fun chooseAccount(paymentStartedAt: Long): Pair<ExternalServiceProperties, LinkedBlockingQueue<PaymentInfo>> {
-        if (Duration.ofSeconds((now() - paymentStartedAt) / 1000) >= paymentOperationTimeout){
-            throw TimeoutException("Payment operation timed out.")
-        }
-
+    private fun chooseAccount(): Pair<ExternalServiceProperties, Boolean> {
         if (!rateLimiter4.tick()
-            || queue4.remainingCapacity() <= 0){
-            if (rateLimiter3.tick()
-                && queue3.remainingCapacity() > 0
-                && Duration.ofSeconds((now() - paymentStartedAt) / 1000) < paymentOperationTimeout)
-                return Pair(properties3, queue3)
-            else{
-                if (rateLimiter2.tick()
-                    && queue2.remainingCapacity() > 0
-                    && Duration.ofSeconds((now() - paymentStartedAt) / 1000) < paymentOperationTimeout)
-                    return Pair(properties2, queue2)
-                else
-                    throw TimeoutException("Payment operation timed out.")
+            || accountExecutor4.queue.remainingCapacity() <= 0) {
+            if (rateLimiter3.tick() && accountExecutor3.queue.remainingCapacity() > 0)
+                return Pair(properties3, true)
+            else {
+                if (rateLimiter2.tick() && accountExecutor2.queue.remainingCapacity() > 0)
+                    return Pair(properties2, true)
+                else {
+                    if (accountExecutor4.queue.remainingCapacity() <= 0 || (processTime4.average() > processTime2.average() && processTime4.average() > processTime3.average())){
+                        if (accountExecutor3.queue.remainingCapacity() <= 0 || processTime3.average() > processTime2.average() )
+                            return Pair(properties2, false)
+                        return Pair(properties3, false)
+                    }
+                    else
+                        return Pair(properties4, false)
+                }
             }
         }
         else
-            return Pair(properties4, queue4)
+            return Pair(properties4, true)
     }
 
 
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
-        var (properties, queue) = Pair(properties4, queue4)
-        try{
-            val (newProperties, newQueue) = chooseAccount(paymentStartedAt)
-            properties = newProperties
-            queue = newQueue
-        }
-        catch (ex: TimeoutException){
-            return
-        }
+        val (properties, isTick) = chooseAccount()
 
         logger.warn("[${properties.accountName}] Submitting payment request for payment $paymentId. Already passed: ${now() - paymentStartedAt} ms")
 
@@ -124,38 +129,46 @@ class PaymentExternalServiceImpl(
             else -> processTime2
         }
 
-        if (time.average() * queue.size + ((now() - paymentStartedAt) / 1000) >= paymentOperationTimeout.seconds) {
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-            }
-            return
-        }
-
-        queue.add(PaymentInfo(paymentId, transactionId, paymentStartedAt))
-
         val accountExecutor = when (properties) {
             properties4 -> accountExecutor4
             properties3 -> accountExecutor3
             else -> accountExecutor2
         }
 
-        accountExecutor.submit {
-            processPaymentRequest(queue, properties)
+        try {
+            if (!isTick) {
+                if (time.average() == 0.0)
+                    Thread.sleep(500)
+                else
+                    Thread.sleep((time.average() * 1000).toLong())
+            }
+            if (time.average() + ((now() - paymentStartedAt) / 1000) >= paymentOperationTimeout.seconds) {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                }
+                return
+            }
+            accountExecutor.submit {
+                processPaymentRequest(paymentId, transactionId, paymentStartedAt, properties)
+            }
+        }
+        catch (ex: RejectedExecutionException){
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+            }
         }
     }
 
-    private fun processPaymentRequest(queue: LinkedBlockingQueue<PaymentInfo>, properties: ExternalServiceProperties) {
-        val paymentInfo = queue.poll()
-
-        if (Duration.ofSeconds((now() - paymentInfo.paymentStartedAt) / 1000) >= paymentOperationTimeout) {
-            paymentESService.update(paymentInfo.paymentId) {
-                it.logProcessing(false, now(), paymentInfo.transactionId, reason = "Request timeout.")
+    private fun processPaymentRequest(paymentId: UUID, transactionId: UUID, paymentStartedAt: Long, properties: ExternalServiceProperties) {
+        if (Duration.ofSeconds((now() - paymentStartedAt) / 1000) >= paymentOperationTimeout) {
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
             }
             return
         }
 
         val request = Request.Builder().run {
-            url("http://localhost:1234/external/process?serviceName=${properties.serviceName}&accountName=${properties.accountName}&transactionId=${paymentInfo.transactionId}")
+            url("http://localhost:1234/external/process?serviceName=${properties.serviceName}&accountName=${properties.accountName}&transactionId=${transactionId}")
             post(emptyBody)
         }.build()
 
@@ -170,31 +183,31 @@ class PaymentExternalServiceImpl(
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                 } catch (e: Exception) {
-                    logger.error("[${properties.accountName}] [ERROR] Payment processed for txId: ${paymentInfo.transactionId}, payment: ${paymentInfo.paymentId}, result code: ${response.code}, reason: ${response.body?.string()}")
+                    logger.error("[${properties.accountName}] [ERROR] Payment processed for txId: ${transactionId}, payment: ${paymentId}, result code: ${response.code}, reason: ${response.body?.string()}")
                     ExternalSysResponse(false, e.message)
                 }
 
-                logger.warn("[${properties.accountName}] Payment processed for txId: ${paymentInfo.transactionId}, payment: ${paymentInfo.paymentId}, succeeded: ${body.result}, message: ${body.message}")
+                logger.warn("[${properties.accountName}] Payment processed for txId: ${transactionId}, payment: ${paymentId}, succeeded: ${body.result}, message: ${body.message}")
 
                 // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
                 // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentInfo.paymentId) {
-                    it.logProcessing(body.result, now(), paymentInfo.transactionId, reason = body.message)
+                paymentESService.update(paymentId) {
+                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
             }
         } catch (e: Exception) {
             when (e) {
                 is SocketTimeoutException -> {
-                    paymentESService.update(paymentInfo.paymentId) {
-                        it.logProcessing(false, now(), paymentInfo.transactionId, reason = "Request timeout.")
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                     }
                 }
 
                 else -> {
-                    logger.error("[${properties.accountName}] Payment failed for txId: ${paymentInfo.transactionId}, payment: ${paymentInfo.paymentId}", e)
+                    logger.error("[${properties.accountName}] Payment failed for txId: ${transactionId}, payment: ${paymentId}", e)
 
-                    paymentESService.update(paymentInfo.paymentId) {
-                        it.logProcessing(false, now(), paymentInfo.transactionId, reason = e.message)
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = e.message)
                     }
                 }
             }
@@ -204,16 +217,9 @@ class PaymentExternalServiceImpl(
                 properties3 -> processTime3
                 else -> processTime2
             }
-
-            time.add((now() - paymentInfo.paymentStartedAt) / 1000)
+            time.add((now() - paymentStartedAt).toDouble() / 1000)
         }
     }
 }
 
 public fun now() = System.currentTimeMillis()
-
-class PaymentInfo(
-    val paymentId: UUID,
-    val transactionId: UUID,
-    val paymentStartedAt: Long
-)
